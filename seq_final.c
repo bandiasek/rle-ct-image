@@ -1,180 +1,129 @@
+// Defines for clock_gettime
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
 #include <string.h>
 
-#define DIM_X 1024
-#define DIM_Y 1024
-#define DIM_Z 314
+// Dimensions specific to the c8.raw dataset
+#define X 1024
+#define Y 1024
+#define Z 314
+#define NUM_VOXELS ((size_t)X * Y * Z)
 #define THRESHOLD 25
-#define TOTAL_VOXELS ((size_t)DIM_X * DIM_Y * DIM_Z)
 
-// Function to load CT scan data
-uint8_t* load_ct_data(const char* filename) {
-    FILE* file = fopen(filename, "rb");
-    if (!file) {
-        fprintf(stderr, "[Error] Cannot open file %s\n", filename);
-        return NULL;
+// We are benchmarking RLE bit-widths from N=2 to N=17
+#define MIN_N 2
+#define MAX_N 17
+#define RLE_VARIANTS (MAX_N - MIN_N + 1)
+
+uint8_t *volume = NULL;
+
+double get_time(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        perror("clock_gettime");
+        exit(1);
     }
-    
-    uint8_t* data = (uint8_t*)malloc(TOTAL_VOXELS * sizeof(uint8_t));
-    if (!data) {
-        fprintf(stderr, "[Error] Memory allocation failed\n");
-        fclose(file);
-        return NULL;
-    }
-    
-    size_t read_count = fread(data, sizeof(uint8_t), TOTAL_VOXELS, file);
-    if (read_count != TOTAL_VOXELS) {
-        fprintf(stderr, "[Error] Read %zu voxels, expected %zu\n", read_count, TOTAL_VOXELS);
-        free(data);
-        fclose(file);
-        return NULL;
-    }
-    
-    fclose(file);
-    return data;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-// Function to apply thresholding and generate metadata
-uint8_t* generate_metadata(const uint8_t* data) {
-    // Allocate memory for metadata (1 bit per voxel, packed into bytes)
-    size_t metadata_bytes = (TOTAL_VOXELS + 7) / 8;
-    uint8_t* metadata = (uint8_t*)calloc(metadata_bytes, sizeof(uint8_t));
-    
-    if (!metadata) {
-        fprintf(stderr, "[Error] Memory allocation failed for metadata\n");
-        return NULL;
+int load_volume(const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) return 1;
+
+    volume = malloc(NUM_VOXELS);
+    if (!volume) { fclose(f); return 1; }
+
+    if (fread(volume, 1, NUM_VOXELS, f) != NUM_VOXELS) {
+        free(volume); fclose(f); return 1;
     }
-    
-    for (size_t i = 0; i < TOTAL_VOXELS; i++) {
-        if (data[i] > THRESHOLD) {
-            // Set bit to 1 (active voxel)
-            size_t byte_idx = i / 8;
-            size_t bit_idx = i % 8;
-            metadata[byte_idx] |= (1 << bit_idx);
+    fclose(f);
+    return 0;
+}
+
+// Calculates the bit cost for a specific run length 'L' and bit-width 'n_bits'.
+// We use 'static inline' here to encourage the compiler to embed this directly
+// into the tight loop below, saving function call overhead.
+static inline uint64_t calc_bits_for_run(size_t length, int n_bits) {
+    size_t max_cap = (1ULL << n_bits) - 1;
+    size_t packets = length / max_cap;
+    if (length % max_cap > 0) packets++;
+
+    // Cost = number of packets * (N bits for count + 1 bit for value)
+    return packets * (n_bits + 1);
+}
+
+void run_sequential_test(void) {
+    printf("\n=== Running Sequential Test ===\n");
+
+    uint64_t bit_costs[RLE_VARIANTS] = {0};
+
+    double start_time = get_time();
+
+    size_t idx = 0;
+
+    // Handle the first voxel separately to avoid checking "if (i==0)"
+    // inside the hot loop millions of times.
+    uint8_t current_val = (volume[0] > THRESHOLD) ? 1 : 0;
+    size_t current_len = 1;
+
+    // Scan the rest of the volume
+    for (size_t i = 1; i < NUM_VOXELS; ++i) {
+        uint8_t next_val = (volume[i] > THRESHOLD) ? 1 : 0;
+
+        if (next_val == current_val) {
+            current_len++;
+        } else {
+            // The run ended.
+            // Instead of saving this run to a list (which consumes memory),
+            // we immediately calculate how many bits this run would cost
+            // for every possible N variant (2..17).
+            for (int n = MIN_N; n <= MAX_N; ++n) {
+                bit_costs[n - MIN_N] += calc_bits_for_run(current_len, n);
+            }
+
+            // Reset for the new run
+            current_val = next_val;
+            current_len = 1;
         }
-        // Otherwise bit remains 0 (passive voxel)
     }
-    
-    return metadata;
+
+    // Don't forget the very last run after the loop finishes
+    for (int n = MIN_N; n <= MAX_N; ++n) {
+        bit_costs[n - MIN_N] += calc_bits_for_run(current_len, n);
+    }
+
+    double end_time = get_time();
+
+    printf(">> Computation Time: %.6f seconds\n", end_time - start_time);
+
+    printf("--- RLE Analysis Results ---\n");
+    for (int n = MIN_N; n <= MAX_N; ++n) {
+        int packet_bits = n + 1;
+        double mb = (double)bit_costs[n - MIN_N] / 8.0 / 1024.0 / 1024.0;
+        printf("N=%2d (%2d b/packet): %12lu bits (%.2f MB)\n",
+               n, packet_bits, bit_costs[n - MIN_N], mb);
+    }
 }
 
-// Function to get bit value from metadata
-int get_bit(const uint8_t* metadata, size_t bit_position) {
-    size_t byte_idx = bit_position / 8;
-    size_t bit_idx = bit_position % 8;
-    return (metadata[byte_idx] >> bit_idx) & 1;
-}
-
-// Function to calculate RLE compressed size for given packet size
-size_t calculate_rle_size(const uint8_t* metadata, int packet_bits) {
-    // packet_bits = 1 bit for value + length_bits for run length
-    int length_bits = packet_bits - 1;
-    size_t max_run_length = (1ULL << length_bits) - 1;
-    
-    size_t total_bits = 0;
-    size_t current_pos = 0;
-    
-    while (current_pos < TOTAL_VOXELS) {
-        // Get current bit value
-        int current_bit = get_bit(metadata, current_pos);
-        
-        // Count consecutive bits with same value
-        size_t run_length = 1;
-        size_t next_pos = current_pos + 1;
-        
-        while (next_pos < TOTAL_VOXELS && 
-               get_bit(metadata, next_pos) == current_bit &&
-               run_length < max_run_length) {
-            run_length++;
-            next_pos++;
-        }
-        
-        // Add one RLE packet
-        total_bits += packet_bits;
-        current_pos += run_length;
-    }
-    
-    return total_bits;
-}
-
-int main(int argc, char* argv[]) {
-    const char* filename = "c8.raw";
-    
-    // Allow custom filename as argument
-    if (argc > 1) {
-        filename = argv[1];
-    }
-    
-    printf("Loading CT scan data from %s...\n", filename);
-    printf("Dimensions: %d x %d x %d voxels\n", DIM_X, DIM_Y, DIM_Z);
-    printf("Total voxels: %zu\n", TOTAL_VOXELS);
-    printf("Threshold: %d\n\n", THRESHOLD);
-    
-    // Load CT data
-    uint8_t* ct_data = load_ct_data(filename);
-    if (!ct_data) {
+int main(void) {
+    if (load_volume("c8.raw") != 0) {
+        fprintf(stderr, "Error: Make sure c8.raw exists (1024x1024x314).\n");
         return 1;
     }
-    
-    printf("CT data loaded successfully.\n");
-    printf("Starting computation...\n\n");
-    
-    // Start timing after data load
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    
-    // Generate metadata by applying threshold
-    uint8_t* metadata = generate_metadata(ct_data);
-    if (!metadata) {
-        free(ct_data);
-        return 1;
-    }
-    
-    // Test RLE compression with different packet sizes (3 to 18 bits)
-    printf("RLE Packet Size (bits) | Compressed Size (bits) | Compressed Size (bytes) | Compression Ratio\n");
-    printf("------------------------|-------------------------|--------------------------|------------------\n");
-    
-    for (int packet_bits = 3; packet_bits <= 18; packet_bits++) {
-        size_t compressed_bits = calculate_rle_size(metadata, packet_bits);
-        size_t compressed_bytes = (compressed_bits + 7) / 8;
-        double compression_ratio = (double)TOTAL_VOXELS / (double)compressed_bits;
-        
-        printf("%23d | %23zu | %24zu | %16.4f\n", 
-               packet_bits, compressed_bits, compressed_bytes, compression_ratio);
-    }
-    
-    // Stop timing
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    
-    // Calculate elapsed time
-    double elapsed_time = (end_time.tv_sec - start_time.tv_sec) + 
-                         (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
-    
-    printf("\nComputation completed in %.6f seconds\n", elapsed_time);
-    
-    // Calculate some statistics
-    size_t active_voxels = 0;
-    for (size_t i = 0; i < TOTAL_VOXELS; i++) {
-        if (get_bit(metadata, i) == 1) {
-            active_voxels++;
-        }
-    }
-    
-    printf("\nStatistics:\n");
-    printf("  Active voxels (value > %d): %zu (%.2f%%)\n", 
-           THRESHOLD, active_voxels, (active_voxels * 100.0) / TOTAL_VOXELS);
-    printf("  Passive voxels (value <= %d): %zu (%.2f%%)\n", 
-           THRESHOLD, TOTAL_VOXELS - active_voxels, 
-           ((TOTAL_VOXELS - active_voxels) * 100.0) / TOTAL_VOXELS);
-    printf("  Original metadata size: %zu bits (%zu bytes)\n", 
-           TOTAL_VOXELS, (TOTAL_VOXELS + 7) / 8);
-    
-    // Cleanup
-    free(ct_data);
-    free(metadata);
-    
+    printf("Volume loaded (%zu voxels).\n", NUM_VOXELS);
+
+    // We touch every byte of the volume before starting the timer.
+    // This brings the data into the CPU cache/RAM, ensuring we measure
+    // pure calculation speed rather than disk paging latency.
+    volatile uint64_t sum = 0;
+    for(size_t i=0; i<NUM_VOXELS; i++) sum += volume[i];
+    printf("Cache warmed up.\n");
+
+    run_sequential_test();
+
+    free(volume);
     return 0;
 }
